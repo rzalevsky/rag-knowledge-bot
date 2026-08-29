@@ -41,3 +41,13 @@ EBAY_DELIVERY_COUNTRY = _env("EBAY_DELIVERY_COUNTRY", "PL")
 
 QDRANT_URL = _env("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = _env("QDRANT_COLLECTION", "laptop_offers")
+
+# How many candidates the vector search stage returns after the metadata
+# filter has narrowed the set (app.py).
+RETRIEVAL_TOP_K = int(_env("RETRIEVAL_TOP_K", "5"))
+
+# LM Studio's local OpenAI-compatible API — see README's Generation row for
+# why: no external API key or per-query cost, keeps the whole pipeline
+# runnable offline.
+LLM_API_BASE = _env("LLM_API_BASE", "http://localhost:1234/v1")
+LLM_MODEL = _env("LLM_MODEL", "qwen2.5-7b-instruct")

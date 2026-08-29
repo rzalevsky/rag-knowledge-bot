@@ -49,6 +49,11 @@ Both the embedder and the Qdrant client are injectable (same pattern as
 `EbayClient`'s `http_client` param) so tests can run without downloading
 the real model or needing a live Qdrant instance.
 
+The model name/prefixes/vector size and `default_embed_fn` loader live in
+`embeddings.py`, shared with `app.py` — passage and query vectors are only
+comparable if they come from the same model, so that config isn't
+duplicated here.
+
 Usage:
     docker compose up -d                   # starts Qdrant on :6333
     python embed.py                        # local/offers.json -> config.QDRANT_COLLECTION
@@ -60,17 +65,15 @@ import argparse
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 import config
+from embeddings import PASSAGE_PREFIX, VECTOR_SIZE, EmbedFn, default_embed_fn
 
 INPUT_PATH = Path("local/offers.json")
-EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
-VECTOR_SIZE = 384
-PASSAGE_PREFIX = "passage: "  # E5 convention — see module docstring
 
 # See module docstring for the confidence caveat on these ranges.
 _CONDITION_BUCKETS: list[tuple[int, int, str]] = [
@@ -79,11 +82,6 @@ _CONDITION_BUCKETS: list[tuple[int, int, str]] = [
     (3000, 6000, "used"),
     (7000, 7000, "for_parts"),
 ]
-
-# Takes a batch of already-prefixed texts, returns one vector per text —
-# batched rather than one-at-a-time so the real sentence-transformers model
-# can use its own internal batching instead of 200 separate forward passes.
-EmbedFn = Callable[[list[str]], Iterable[Iterable[float]]]
 
 
 def condition_bucket(condition_id: Any) -> str:
@@ -139,19 +137,6 @@ def ensure_collection(client: QdrantClient, name: str, vector_size: int = VECTOR
         collection_name=name,
         vectors_config=qmodels.VectorParams(size=vector_size, distance=qmodels.Distance.COSINE),
     )
-
-
-def default_embed_fn(model_name: str = EMBEDDING_MODEL_NAME) -> EmbedFn:
-    """Loads the real sentence-transformers model. Imported lazily so tests
-    that inject a stub embedder never need the model downloaded."""
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(model_name)
-
-    def embed(texts: list[str]) -> list[list[float]]:
-        return model.encode(texts, show_progress_bar=False).tolist()
-
-    return embed
 
 
 def parse_args() -> argparse.Namespace:
