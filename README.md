@@ -4,8 +4,9 @@ Retrieval-augmented answers over a real marketplace search: "find me a used lapt
 that actually fits these constraints" against live eBay listings, with the
 retrieval decisions written down rather than left to defaults.
 
-**Status: in progress.** Stage 1 (eBay ingest, below) is done and tested.
-Embeddings, Qdrant, and the answering API are not built yet — see Roadmap.
+**Status: in progress.** Stage 1 (eBay ingest) and Stage 2 (embeddings +
+Qdrant upsert, both below) are done and tested. The answering API is not
+built yet — see Roadmap.
 
 ## The problem this solves
 
@@ -47,15 +48,15 @@ across all sellers, no user login, confirmed against the docs before writing
 
 ```
 eBay Browse API → normalize → chunking → embeddings → Qdrant → retrieval → reranking → answer with citations
-                                  ↑ you are here (ingest.py) for the first half
+                                              ↑ you are here (embed.py)
 ```
 
 | Stage | Decision | Reasoning |
 |---|---|---|
 | Source | eBay Browse API (`item_summary/search`, OAuth2 client_credentials) | Official, public, read-only, explicitly designed for third-party buyer search — no scraping, no ToS risk |
 | Chunking | one item = one chunk | Listings are short (title + a handful of fields); splitting further would lose context, not add it |
-| Metadata filter | price, condition, location as structured fields, applied *before* vector search | These are exact constraints ("under $500" isn't a similarity question) — forcing them through embeddings would be slower and less precise than a plain filter. `condition` comes back in the seller's marketplace language (`Gebraucht`/`Used`/`Używany`/`Usato` all mean "used") — needs normalizing to a fixed vocabulary before it's filterable, deferred to `embed.py` |
-| Embeddings | ⟨not chosen yet⟩ | ⟨candidates: general-purpose vs multilingual model vs local inference cost — decide in stage 2⟩ |
+| Metadata filter | price, condition, location as structured fields, applied *before* vector search | These are exact constraints ("under $500" isn't a similarity question) — forcing them through embeddings would be slower and less precise than a plain filter. `condition` comes back in the seller's marketplace language (`Gebraucht`/`Used`/`Używany`/`Usato` all mean "used") — needs normalizing to a fixed vocabulary before it's filterable, done in `embed.py` via eBay's locale-independent `conditionId` |
+| Embeddings | `intfloat/multilingual-e5-small` (sentence-transformers, 384-dim, local inference) | A live ingest run showed titles mixing German/Italian/Polish/English; E5 is contrastively trained for retrieval (query/passage pairs), not just general sentence similarity — this is a retrieval system, not a paraphrase-similarity demo |
 | Vector store | Qdrant | Payload filtering alongside vector search in one query, runs locally in Docker |
 | Retrieval | metadata filter narrows the set, then vector search ranks by the free-text ask | Hybrid, not pure dense retrieval — see `docs/adr` (not written yet) for why |
 | Generation | ⟨model TBD⟩, answer constrained to retrieved items, cites listing URLs | Refuses rather than guessing when no item meets the hard constraints |
@@ -93,7 +94,7 @@ Confirmed against a live production run (200 items, `EBAY_PL` marketplace):
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                            # 7 tests, all against a mocked API — no credentials needed
+pytest                            # 18 tests (eBay client + embed.py), all mocked/stubbed — no credentials, no live Qdrant, no model download needed
 
 cp .env.example .env              # then fill in EBAY_CLIENT_ID / EBAY_CLIENT_SECRET
 python ingest.py                  # -> local/offers.json
@@ -109,10 +110,59 @@ project never logs in as a buyer or seller.
 the confirmed findings above for the filters that actually scope results to
 laptops shipping to Poland.
 
+## Stage 2 — embeddings (done)
+
+`embed.py` reads `local/offers.json`, embeds each item's title with
+`intfloat/multilingual-e5-small` (sentence-transformers, 384-dim, runs
+locally — no API key, no per-call cost — see the Embeddings row above for
+why this model), and upserts one Qdrant point per item. E5's own convention
+requires prefixing text before encoding: `"passage: "` for indexed
+documents (applied here), `"query: "` for search queries (deferred to
+`app.py`, which does the querying).
+
+Condition normalization uses `conditionId` from the raw eBay payload
+instead of the localized `condition` string, since `conditionId` is
+numeric and locale-independent (confirmed live: `conditionId "1000"`
+paired with `condition "Neu"`, German for "New"). It's bucketed coarsely —
+a buyer's filter doesn't need eBay's full tier list:
+
+```
+1000-1750 -> new
+2000-2750 -> refurbished
+3000-6000 -> used
+7000      -> for_parts
+otherwise -> unknown
+```
+
+The exact numeric ranges come from a secondary source (eBay's own
+condition-id-values reference page timed out when fetched directly while
+writing this) corroborated by one live data point, not independently
+confirmed end to end the way Stage 1's findings are — flagged here rather
+than presented as equally certain. Both the bucket (`condition_bucket`,
+for filtering) and the original raw string (`condition_raw`, for display)
+land in the Qdrant payload; normalization is lossy by design but the
+source string is never discarded.
+
+eBay's `itemId` (e.g. `"v1|198586449169|0"`) isn't a valid Qdrant point ID
+(Qdrant requires an unsigned int or a UUID), so each point's id is derived
+via `uuid.uuid5(uuid.NAMESPACE_URL, item.id)` — stable across runs, so
+re-running `embed.py` after a fresh `ingest.py` updates existing points
+(upsert) instead of duplicating them.
+
+Same dependency-injection pattern as `EbayClient`'s `http_client` param:
+both the embedder and the Qdrant client are injectable, so
+`tests/test_embed.py` runs without downloading the real model or needing a
+live Qdrant instance.
+
+```bash
+docker compose up -d              # starts Qdrant on :6333
+python embed.py                   # local/offers.json -> config.QDRANT_COLLECTION
+```
+
 ## Roadmap
 
 - [x] eBay client + ingest, tested against a mocked API
-- [ ] Embedding + Qdrant upsert (`embed.py`)
+- [x] Embedding + Qdrant upsert (`embed.py`)
 - [ ] FastAPI service: hybrid retrieval + grounded generation (`app.py`)
 - [ ] Worked examples against real listings — including at least one query with
       zero matches, showing the honest refusal rather than a forced answer
@@ -126,11 +176,6 @@ channels that don't require working around a site's own protections.
 
 ## Stack
 
-Python · httpx · Qdrant (planned) · FastAPI (planned) · Docker
+Python · httpx · sentence-transformers · Qdrant · FastAPI (planned) · Docker
 
-## Running Qdrant (for stage 2, not needed yet)
-
-```bash
-docker compose up -d
-# UI at http://localhost:6333/dashboard
-```
+Qdrant's dashboard, once `docker compose up -d` is running: http://localhost:6333/dashboard
