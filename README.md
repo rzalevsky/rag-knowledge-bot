@@ -312,13 +312,60 @@ logs for this call).
 - [x] FastAPI service: hybrid retrieval + grounded generation (`app.py`)
 - [x] Worked examples against real listings — including at least one query with
       zero matches, showing the honest refusal rather than a forced answer
-- [ ] Write up what I'd improve — most likely hybrid dense+BM25 search, since pure
-      embeddings tend to lose exact model numbers and rare terms
+- [x] Write up what I'd improve — see below
 
 **Allegro and OLX** are both out of scope: Allegro for the reason above (no
 third-party marketplace search in its public API), OLX because it has no public
 API for third-party read access and this project only sources data through
 channels that don't require working around a site's own protections.
+
+## What I'd improve
+
+Ranked by what would actually change behavior, not by effort:
+
+1. **Hybrid dense+BM25 retrieval.** Pure embedding similarity is weak on
+   exact tokens — a query for `i5-1135G7` can lose to a listing that's
+   semantically close but has a different CPU, because dense vectors
+   generalize past exact model numbers by design. The pipeline diagram at
+   the top of this README already names this as the reason retrieval isn't
+   pure dense search; it just isn't implemented yet. Qdrant supports fusing
+   a sparse (BM25-style) query with the dense one in a single call, which
+   is the natural place to add this rather than a second bolt-on system.
+
+2. **No reranking, despite the pipeline diagram promising one.** Stage 3
+   hands the raw top-`k` vector-search results straight to the LLM. A
+   cross-encoder reranker over those candidates (also available via
+   `sentence-transformers`, no new infra) would do a cheaper, more
+   consistent first pass at "does this really match the free-text ask"
+   before the LLM has to make that call cold, and would likely reduce
+   cases like the worked example above where the best available match
+   still only partially fits.
+
+3. **Full item detail is never fetched.** `ebay_client.py` has flagged
+   this since Stage 1: RAM and CPU exist as clean, structured "aspects"
+   only via a separate `GET /item/{itemId}` call per listing, deferred
+   because Stage 1 didn't need it yet. Right now the LLM infers specs from
+   free-text titles, which mostly works because sellers put specs in the
+   title anyway — but a listing with the RAM only in its description,
+   not its title, is invisible to a `≥16GB` ask no matter how good
+   retrieval is, because that constraint was never structured data to
+   begin with.
+
+4. **No evaluation harness.** The two worked examples above were read by
+   eye, not measured. A small labeled set — a few dozen `(query, hard
+   constraints, expected-to-match item ids)` triples — would turn "does
+   this still work" from a spot check into a number: retrieval
+   precision/recall, and a faithfulness check that the LLM's answer only
+   cites items actually present in its context. Worth doing before this
+   corpus or the prompt changes again.
+
+5. **`condition_bucket`'s numeric ranges are one live data point plus a
+   secondary source, not eBay's own docs.** Flagged honestly in the Stage
+   2 section rather than presented as settled — eBay's
+   `condition-id-values` reference page timed out every time it was
+   fetched directly while building this. Worth a second pass once that
+   page is reachable, since a wrong boundary would silently misclassify
+   a condition tier rather than error out.
 
 ## Stack
 
